@@ -1,0 +1,17 @@
+[Unit]
+Description=BIMCraft Xvfb display :99
+Documentation=https://github.com/IPedrax/BIMCraft
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=bimcraft
+Group=bimcraft
+Environment=HOME=/home/bimcraft
+ExecStart=/usr/bin/Xvfb :99 -screen 0 1920x1080x24 -ac +extension GLX +render -noreset -nolisten tcp
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

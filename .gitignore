@@ -1,0 +1,12 @@
+# Logs
+*.log
+/tmp/
+
+# Release artifacts / downloads
+*.deb
+*.AppImage
+SHA256SUMS
+
+# Local test scratch
+.superpowers/
+.test/

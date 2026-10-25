@@ -1,0 +1,19 @@
+[Unit]
+Description=BIMCraft x11vnc (localhost only)
+Documentation=https://github.com/IPedrax/BIMCraft
+After=network-online.target bimcraft-xvfb.service
+Wants=network-online.target
+Requires=bimcraft-xvfb.service
+
+[Service]
+Type=simple
+User=bimcraft
+Group=bimcraft
+Environment=DISPLAY=:99
+Environment=HOME=/home/bimcraft
+ExecStart=/usr/bin/x11vnc -display :99 -rfbport 5900 -localhost -rfbauth /etc/bimcraft/vnc.pass -forever -shared -noxdamage -repeat -cursor arrow -quiet
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

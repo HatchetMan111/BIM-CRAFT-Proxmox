@@ -1,0 +1,24 @@
+[Unit]
+Description=BIMCraft desktop in Xvfb
+Documentation=https://github.com/IPedrax/BIMCraft
+After=network-online.target bimcraft-xvfb.service
+Wants=network-online.target
+Requires=bimcraft-xvfb.service
+
+[Service]
+Type=simple
+User=bimcraft
+Group=bimcraft
+Environment=DISPLAY=:99
+Environment=HOME=/home/bimcraft
+Environment=LIBGL_ALWAYS_SOFTWARE=1
+Environment=GALLIUM_DRIVER=llvmpipe
+Environment=XDG_RUNTIME_DIR=/run/bimcraft
+RuntimeDirectory=bimcraft
+RuntimeDirectoryMode=0700
+ExecStart=/usr/local/bin/bimcraft-session
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

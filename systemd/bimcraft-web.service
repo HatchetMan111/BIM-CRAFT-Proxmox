@@ -1,0 +1,17 @@
+[Unit]
+Description=BIMCraft noVNC web interface
+Documentation=https://github.com/IPedrax/BIMCraft
+After=network-online.target bimcraft-vnc.service
+Wants=network-online.target
+Requires=bimcraft-vnc.service
+
+[Service]
+Type=simple
+User=bimcraft
+Group=bimcraft
+ExecStart=/usr/bin/websockify --web=/usr/share/novnc 0.0.0.0:6080 127.0.0.1:5900
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
