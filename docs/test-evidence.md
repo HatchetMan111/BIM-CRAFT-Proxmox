@@ -134,6 +134,56 @@ Der Host-Pfad `ensure_dns` wurde ebenfalls mit einer defekten
 `/etc/resolv.conf` getestet; er setzt `pct set --nameserver`, schreibt die
 Datei im Container und wartet auf `deb.debian.org` und `github.com`.
 
+## 2b. DNS-Haertung: transienter DNS-Ausfall waehrend apt-get
+
+Zwei Ergaenzungen nach dem ersten Real-Host-Fehlerfall (DNS funktionierte bei
+der ersten Pruefung, brach waehrend `apt-get install` weg):
+
+1. **Host:** `ensure_dns` ruft `pct set --nameserver` **jeden Lauf** auf
+   (auch bei funktionierendem DNS), damit der Nameserver dauerhaft in der
+   LXC-Config landet (`pct config` enthaelt danach immer eine
+   `nameserver:`-Zeile).
+2. **Container:** `repair_container_dns` wird vor jedem apt-Retry aufgerufen,
+   schreibt `/etc/resolv.conf` mit Primary + `1.1.1.1` + `9.9.9.9` neu und
+   prueft erneut; bei anhaltendem Fehler bricht das Script mit Diagnose ab
+   (`cat /etc/resolv.conf`, `getent ahostsv4`).
+
+Simulation im Container: ein `apt-get`-Wrapper liest bei dem ersten
+`apt-get update`-Aufruf `/etc/resolv.conf` auf `nameserver 127.0.0.53` um und
+meldet Exit 100. Danach lief das Provision-Script mit `BIMCRAFT_DNS=1.1.1.1`:
+
+```bash
+docker exec bimcraft-dns-test bash -lc '
+  mkdir -p /tmp/testbin; cat >/tmp/testbin/apt-get <<"EOF"
+#!/usr/bin/env bash
+if [[ " $* " == *" update "* && ! -e /tmp/apt-failed-once ]]; then
+  touch /tmp/apt-failed-once
+  printf "nameserver 127.0.0.53\n" > /etc/resolv.conf
+  exit 100
+fi
+exec /usr/bin/apt-get "$@"
+EOF
+  chmod +x /tmp/testbin/apt-get'
+PATH=/tmp/testbin:$PATH docker exec -e BIMCRAFT_VERSION=0.7.0 \
+  -e BIMCRAFT_DNS=1.1.1.1 bimcraft-dns-test bash /tmp/provision-new.sh
+```
+
+Beobachtet:
+
+```text
+[OK]    DNS im Container funktioniert (Nameserver 1.1.1.1).
+simulierter transienter DNS-Fehler
+[WARN]  apt-get update Versuch 1/3 fehlgeschlagen – DNS/Netzwerk reparieren ...
+[WARN]  DNS im Container defekt – schreibe Nameserver 1.1.1.1 und Fallbacks ...
+[OK]    DNS im Container funktioniert (Nameserver 1.1.1.1).
+[OK]    Systempakete installiert.
+[OK]    Provisionierung abgeschlossen.
+```
+
+Host-Verifikation per `pct`-Wrapper-Log (Mock): der zweite Host-Lauf mit
+`--ctid 100 --update` zeigt, dass `pct set 100 --nameserver <IP>` **vor** dem
+DNS-Check aufgerufen wird, unabhaengig vom DNS-Status. Exit-Code 0.
+
 ## 3. Reboot-Simulation (frischer Container)
 
 ```bash

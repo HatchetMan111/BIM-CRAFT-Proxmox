@@ -466,15 +466,19 @@ wait_for_ip() {
   die "Container hat keine IPv4-Adresse erhalten (DHCP/Netzwerk pruefen)."
 }
 
+container_dns_ok() {
+  pct exec "$CTID" -- bash -c 'timeout 5 getent ahostsv4 deb.debian.org >/dev/null 2>&1 && timeout 5 getent ahostsv4 github.com >/dev/null 2>&1'
+}
+
 ensure_dns() {
   local i
-  if pct exec "$CTID" -- bash -c 'timeout 5 getent hosts deb.debian.org >/dev/null 2>&1 && timeout 5 getent hosts github.com >/dev/null 2>&1'; then
-    msg_ok "DNS im Container funktioniert."
+  pct set "$CTID" --nameserver "$DNS_SERVER" >/dev/null 2>&1 \
+    || msg_warn "pct set --nameserver fehlgeschlagen; setze /etc/resolv.conf direkt."
+  if container_dns_ok; then
+    msg_ok "DNS im Container funktioniert (Nameserver ${DNS_SERVER})."
     return 0
   fi
   msg_warn "DNS im Container defekt – setze Nameserver ${DNS_SERVER} ..."
-  pct set "$CTID" --nameserver "$DNS_SERVER" >/dev/null 2>&1 \
-    || msg_warn "pct set --nameserver fehlgeschlagen; setze /etc/resolv.conf direkt."
   pct exec "$CTID" -- bash -c '
     {
       printf "nameserver %s\n" "$1"
@@ -483,13 +487,16 @@ ensure_dns() {
     } > /etc/resolv.conf
   ' _ "$DNS_SERVER" || die "Konnte /etc/resolv.conf im Container nicht schreiben."
   for i in $(seq 1 30); do
-    if pct exec "$CTID" -- bash -c 'timeout 5 getent hosts deb.debian.org >/dev/null 2>&1 && timeout 5 getent hosts github.com >/dev/null 2>&1'; then
+    if container_dns_ok; then
       msg_ok "DNS im Container funktioniert (Nameserver ${DNS_SERVER})."
       return 0
     fi
     sleep 2
   done
+  msg_error "--- /etc/resolv.conf im Container ---"
   pct exec "$CTID" -- cat /etc/resolv.conf 2>&1 || true
+  msg_error "--- getent ahostsv4 deb.debian.org ---"
+  pct exec "$CTID" -- getent ahostsv4 deb.debian.org 2>&1 || true
   die "DNS im Container nicht erreichbar (Nameserver ${DNS_SERVER}, deb.debian.org)."
 }
 
@@ -580,29 +587,44 @@ gen_password() {
 
 export DEBIAN_FRONTEND=noninteractive
 
-ensure_container_dns() {
-  local i ns
-  if timeout 5 getent hosts deb.debian.org >/dev/null 2>&1 \
-    && timeout 5 getent hosts github.com >/dev/null 2>&1; then
-    return 0
-  fi
-  ns="${DNS_SERVER:-1.1.1.1}"
-  msg_warn "DNS im Container defekt – schreibe Nameserver ${ns} und Fallbacks ..."
+container_dns_ok() {
+  timeout 5 getent ahostsv4 deb.debian.org >/dev/null 2>&1 \
+    && timeout 5 getent ahostsv4 github.com >/dev/null 2>&1
+}
+
+write_resolv_conf() {
+  local ns="${DNS_SERVER:-1.1.1.1}"
   {
     printf 'nameserver %s\n' "$ns"
     [[ "$ns" == "1.1.1.1" ]] || printf 'nameserver 1.1.1.1\n'
-    printf 'nameserver 9.9.9.9\n'
+    [[ "$ns" == "9.9.9.9" ]] || printf 'nameserver 9.9.9.9\n'
   } > /etc/resolv.conf
+}
+
+repair_container_dns() {
+  local i ns="${DNS_SERVER:-1.1.1.1}"
+  msg_warn "DNS im Container defekt – schreibe Nameserver ${ns} und Fallbacks ..."
+  write_resolv_conf
   for i in $(seq 1 15); do
-    if timeout 5 getent hosts deb.debian.org >/dev/null 2>&1 \
-      && timeout 5 getent hosts github.com >/dev/null 2>&1; then
+    if container_dns_ok; then
       msg_ok "DNS im Container funktioniert (Nameserver ${ns})."
       return 0
     fi
     sleep 2
   done
+  msg_error "--- /etc/resolv.conf ---"
   cat /etc/resolv.conf >&2 || true
+  msg_error "--- getent ahostsv4 deb.debian.org ---"
+  getent ahostsv4 deb.debian.org >&2 || true
   die "DNS im Container nicht erreichbar (Nameserver ${ns}, deb.debian.org)."
+}
+
+ensure_container_dns() {
+  if container_dns_ok; then
+    msg_ok "DNS im Container funktioniert (Nameserver ${DNS_SERVER:-auto})."
+    return 0
+  fi
+  repair_container_dns
 }
 
 apt_update() {
@@ -622,7 +644,8 @@ for attempt in 1 2 3; do
   if (( attempt == 3 )); then
     die "apt-get update fehlgeschlagen (DNS/Netzwerk pruefen)."
   fi
-  msg_warn "apt-get update Versuch ${attempt}/3 fehlgeschlagen – retry in 5 s ..."
+  msg_warn "apt-get update Versuch ${attempt}/3 fehlgeschlagen – DNS/Netzwerk reparieren ..."
+  repair_container_dns
   sleep 5
 done
 for attempt in 1 2 3; do
@@ -638,7 +661,8 @@ for attempt in 1 2 3; do
   if (( attempt == 3 )); then
     die "apt-get install fehlgeschlagen (DNS/Netzwerk pruefen)."
   fi
-  msg_warn "apt-get install Versuch ${attempt}/3 fehlgeschlagen – retry in 5 s ..."
+  msg_warn "apt-get install Versuch ${attempt}/3 fehlgeschlagen – DNS/Netzwerk reparieren ..."
+  repair_container_dns
   sleep 5
 done
 msg_ok "Systempakete installiert."
