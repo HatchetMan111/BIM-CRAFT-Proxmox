@@ -36,6 +36,7 @@ Produktivbetrieb; der Installer erzeugt einen unprivilegierten LXC.
 | 6 | Host-Script, Neu-Anlage-Pfad (`--ctid 102`) mit gemocktem `pct create` | Exit 0 |
 | 7 | Hostname-Schutz bei fremdem CT | Exit 1, Abbruch vor Aenderungen |
 | 8 | `tests/reboot-test.sh --reboot` gegen echten Container | 10/10 Checks |
+| 9 | DNS-Fallback: defekte `resolv.conf` (`127.0.0.53`) | automatisch korrigiert, Exit 0 |
 
 ## 1. Statische Checks
 
@@ -105,6 +106,33 @@ Zusaetzlich wurde die Portkonfiguration geprueft: mit
 Script erfolgreich; die Units enthielten danach `0.0.0.0:16081`,
 `127.0.0.1:15900` und `-rfbport 15900`. Anschliessend wurde der Container
 wieder auf 6080/5900 provisioniert.
+
+## 2a. DNS-Fallback
+
+In einem frischen Container wurde `/etc/resolv.conf` absichtlich auf den
+Host-Stub `nameserver 127.0.0.53` gesetzt. Danach lief das finale
+Provision-Script mit `BIMCRAFT_DNS=1.1.1.1`:
+
+```bash
+docker exec bimcraft-fresh sh -c 'printf "nameserver 127.0.0.53\n" > /etc/resolv.conf'
+docker exec -e BIMCRAFT_VERSION=0.7.0 \
+  -e BIMCRAFT_NOVNC_PASSWORD=test-passwort \
+  -e BIMCRAFT_DNS=1.1.1.1 \
+  bimcraft-fresh bash /root/bimcraft-provision.sh
+```
+
+Beobachtet:
+
+```text
+[WARN]  DNS im Container defekt – schreibe Nameserver 1.1.1.1 und Fallbacks ...
+[OK]    DNS im Container funktioniert (Nameserver 1.1.1.1).
+[OK]    Systempakete installiert.
+[OK]    Provisionierung abgeschlossen.
+```
+
+Der Host-Pfad `ensure_dns` wurde ebenfalls mit einer defekten
+`/etc/resolv.conf` getestet; er setzt `pct set --nameserver`, schreibt die
+Datei im Container und wartet auf `deb.debian.org` und `github.com`.
 
 ## 3. Reboot-Simulation (frischer Container)
 

@@ -95,6 +95,7 @@ Optionen:
   --bridge NAME        Netzwerk-Bridge (Default: ${DEFAULT_BRIDGE})
   --ip CIDR            statische IP, z.B. 192.168.1.50/24 (Default: dhcp)
   --gateway IP         Gateway bei statischer IP
+  --nameserver IP      DNS-Server im Container (Default: Host-DNS, sonst 1.1.1.1)
   --password PW        Root-Passwort (Default: zufaellig, wird angezeigt)
   --ssh-key PATH       SSH-Public-Key in den Container uebernehmen (optional)
   --novnc-password PW  noVNC-Passwort vorgeben (Default: zufaellig/beibehalten)
@@ -194,6 +195,7 @@ NOVNC_PASSWORD_ARG=""
 RESET_PASSWORD="0"
 IPCFG="dhcp"
 GATEWAY=""
+DNS_SERVER="${DNS_SERVER:-}"
 UPDATE_ONLY="0"
 UNINSTALL="0"
 ASSUME_YES="0"
@@ -212,6 +214,7 @@ while [[ $# -gt 0 ]]; do
     --bridge)           BRIDGE="${2:?--bridge braucht einen Wert}"; shift 2 ;;
     --ip)               IPCFG="${2:?--ip braucht einen Wert}"; shift 2 ;;
     --gateway|--gw)     GATEWAY="${2:?--gateway braucht einen Wert}"; shift 2 ;;
+    --nameserver|--dns) DNS_SERVER="${2:?--nameserver braucht einen Wert}"; shift 2 ;;
     --password)         ROOT_PASSWORD="${2:?--password braucht einen Wert}"; shift 2 ;;
     --ssh-key)          SSH_KEY_ARG="${2:?--ssh-key braucht einen Wert}"; shift 2 ;;
     --novnc-password)   NOVNC_PASSWORD_ARG="${2:?--novnc-password braucht einen Wert}"; shift 2 ;;
@@ -240,6 +243,18 @@ fi
 # ---------------------------------------------------------------------------
 is_uint() { [[ "$1" =~ ^[0-9]+$ ]]; }
 
+detect_nameserver() {
+  local ns=""
+  ns="$(awk '$1 == "nameserver" {print $2}' /etc/resolv.conf 2>/dev/null \
+    | grep -vE '^(127\.|::1$)' | head -n1 || true)"
+  if [[ -z "$ns" ]] && command -v resolvectl >/dev/null 2>&1; then
+    ns="$(resolvectl status 2>/dev/null \
+      | awk '/DNS Servers:/{for (i = 3; i <= NF; i++) print $i}' \
+      | grep -vE '^(127\.|::1$)' | head -n1 || true)"
+  fi
+  printf '%s' "${ns:-1.1.1.1}"
+}
+
 [[ "$(id -u)" == "0" ]] || die "Bitte als root auf dem Proxmox-Host ausfuehren (sudo -i)."
 command -v pct >/dev/null 2>&1 || die "pct nicht gefunden – laeuft das Script auf einem Proxmox-VE-Host?"
 
@@ -265,6 +280,11 @@ for port_var in WEB_PORT VNC_PORT; do
   fi
 done
 (( WEB_PORT != VNC_PORT )) || die "WEB_PORT und VNC_PORT muessen unterschiedlich sein."
+
+if [[ -n "$DNS_SERVER" ]]; then
+  [[ "$DNS_SERVER" =~ ^[0-9a-fA-F:.]+$ ]] || die "--nameserver ungueltig: $DNS_SERVER"
+fi
+[[ -n "$DNS_SERVER" ]] || DNS_SERVER="$(detect_nameserver)"
 
 if [[ "$UNINSTALL" != "1" ]]; then
   (( CORES >= MIN_CORES )) || die "vCPU zu klein: $CORES (Minimum $MIN_CORES, empfohlen $DEFAULT_CORES)."
@@ -403,6 +423,7 @@ create_ct() {
     --swap "$SWAP" \
     --rootfs "${STORAGE}:${DISK}" \
     --net0 "$net" \
+    --nameserver "$DNS_SERVER" \
     --unprivileged "$UNPRIVILEGED" \
     --features "$FEATURES" \
     --onboot 1 \
@@ -445,15 +466,31 @@ wait_for_ip() {
   die "Container hat keine IPv4-Adresse erhalten (DHCP/Netzwerk pruefen)."
 }
 
-wait_for_dns() {
+ensure_dns() {
   local i
+  if pct exec "$CTID" -- bash -c 'timeout 5 getent hosts deb.debian.org >/dev/null 2>&1 && timeout 5 getent hosts github.com >/dev/null 2>&1'; then
+    msg_ok "DNS im Container funktioniert."
+    return 0
+  fi
+  msg_warn "DNS im Container defekt – setze Nameserver ${DNS_SERVER} ..."
+  pct set "$CTID" --nameserver "$DNS_SERVER" >/dev/null 2>&1 \
+    || msg_warn "pct set --nameserver fehlgeschlagen; setze /etc/resolv.conf direkt."
+  pct exec "$CTID" -- bash -c '
+    {
+      printf "nameserver %s\n" "$1"
+      [[ "$1" == "1.1.1.1" ]] || printf "nameserver 1.1.1.1\n"
+      [[ "$1" == "9.9.9.9" ]] || printf "nameserver 9.9.9.9\n"
+    } > /etc/resolv.conf
+  ' _ "$DNS_SERVER" || die "Konnte /etc/resolv.conf im Container nicht schreiben."
   for i in $(seq 1 30); do
-    if pct exec "$CTID" -- bash -c 'getent hosts github.com >/dev/null 2>&1'; then
+    if pct exec "$CTID" -- bash -c 'timeout 5 getent hosts deb.debian.org >/dev/null 2>&1 && timeout 5 getent hosts github.com >/dev/null 2>&1'; then
+      msg_ok "DNS im Container funktioniert (Nameserver ${DNS_SERVER})."
       return 0
     fi
     sleep 2
   done
-  die "DNS/Internet im Container nicht erreichbar (github.com)."
+  pct exec "$CTID" -- cat /etc/resolv.conf 2>&1 || true
+  die "DNS im Container nicht erreichbar (Nameserver ${DNS_SERVER}, deb.debian.org)."
 }
 
 install_ssh_key() {
@@ -480,6 +517,7 @@ RESET_PASSWORD="${BIMCRAFT_RESET_PASSWORD:-0}"
 DEBUG="${BIMCRAFT_DEBUG:-0}"
 WEB_PORT="${BIMCRAFT_WEB_PORT:-6080}"
 VNC_PORT="${BIMCRAFT_VNC_PORT:-5900}"
+DNS_SERVER="${BIMCRAFT_DNS:-}"
 LOG_FILE="/var/log/bimcraft-provision.log"
 
 mkdir -p /var/log
@@ -542,15 +580,67 @@ gen_password() {
 
 export DEBIAN_FRONTEND=noninteractive
 
+ensure_container_dns() {
+  local i ns
+  if timeout 5 getent hosts deb.debian.org >/dev/null 2>&1 \
+    && timeout 5 getent hosts github.com >/dev/null 2>&1; then
+    return 0
+  fi
+  ns="${DNS_SERVER:-1.1.1.1}"
+  msg_warn "DNS im Container defekt – schreibe Nameserver ${ns} und Fallbacks ..."
+  {
+    printf 'nameserver %s\n' "$ns"
+    [[ "$ns" == "1.1.1.1" ]] || printf 'nameserver 1.1.1.1\n'
+    printf 'nameserver 9.9.9.9\n'
+  } > /etc/resolv.conf
+  for i in $(seq 1 15); do
+    if timeout 5 getent hosts deb.debian.org >/dev/null 2>&1 \
+      && timeout 5 getent hosts github.com >/dev/null 2>&1; then
+      msg_ok "DNS im Container funktioniert (Nameserver ${ns})."
+      return 0
+    fi
+    sleep 2
+  done
+  cat /etc/resolv.conf >&2 || true
+  die "DNS im Container nicht erreichbar (Nameserver ${ns}, deb.debian.org)."
+}
+
+apt_update() {
+  apt-get -qq -o Acquire::ForceIPv4=true -o Acquire::Retries=3 -o Acquire::http::Timeout=20 update
+}
+
+apt_install() {
+  apt-get install -y --no-install-recommends \
+    -o Acquire::ForceIPv4=true -o Acquire::Retries=3 -o Acquire::http::Timeout=20 "$@"
+}
+
+ensure_container_dns
+
 msg_info "Installiere Systemabhaengigkeiten ..."
-apt-get update -qq
-apt-get install -y --no-install-recommends \
-  ca-certificates curl xz-utils iproute2 \
-  xvfb x11vnc novnc websockify openbox x11-utils \
-  libgl1 libglx-mesa0 libegl1 libegl-mesa0 libgl1-mesa-dri \
-  libxkbcommon0 libx11-6 libxcb1 libxcb-render0 libxcb-shape0 libxcb-xfixes0 \
-  libxcursor1 libxrandr2 libxi6 libxrender1 libxext6 \
-  fonts-dejavu-core
+for attempt in 1 2 3; do
+  if apt_update; then break; fi
+  if (( attempt == 3 )); then
+    die "apt-get update fehlgeschlagen (DNS/Netzwerk pruefen)."
+  fi
+  msg_warn "apt-get update Versuch ${attempt}/3 fehlgeschlagen – retry in 5 s ..."
+  sleep 5
+done
+for attempt in 1 2 3; do
+  if apt_install \
+    ca-certificates curl xz-utils iproute2 \
+    xvfb x11vnc novnc websockify openbox x11-utils \
+    libgl1 libglx-mesa0 libegl1 libegl-mesa0 libgl1-mesa-dri \
+    libxkbcommon0 libx11-6 libxcb1 libxcb-render0 libxcb-shape0 libxcb-xfixes0 \
+    libxcursor1 libxrandr2 libxi6 libxrender1 libxext6 \
+    fonts-dejavu-core; then
+    break
+  fi
+  if (( attempt == 3 )); then
+    die "apt-get install fehlgeschlagen (DNS/Netzwerk pruefen)."
+  fi
+  msg_warn "apt-get install Versuch ${attempt}/3 fehlgeschlagen – retry in 5 s ..."
+  sleep 5
+done
 msg_ok "Systempakete installiert."
 
 if [[ "$(dpkg --print-architecture)" != "amd64" ]]; then
@@ -818,6 +908,7 @@ provision_ct() {
     "BIMCRAFT_DEBUG=$DEBUG" \
     "BIMCRAFT_WEB_PORT=$WEB_PORT" \
     "BIMCRAFT_VNC_PORT=$VNC_PORT" \
+    "BIMCRAFT_DNS=$DNS_SERVER" \
     bash /root/bimcraft-provision.sh
   if [[ "$xtrace_was_on" == "1" ]]; then
     set -x
@@ -986,7 +1077,7 @@ fi
 msg_info "Starte Container ..."
 start_ct
 wait_for_ip
-wait_for_dns
+ensure_dns
 install_ssh_key
 
 provision_ct

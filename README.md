@@ -64,6 +64,7 @@ Das noVNC-Passwort steht in der Installationsausgabe und in
 | `--bridge NAME` | Netzwerk-Bridge | `vmbr0` |
 | `--ip CIDR` | statische IP, z.B. `192.168.1.50/24` | `dhcp` |
 | `--gateway IP` | Gateway bei statischer IP | – |
+| `--nameserver IP` | DNS-Server im Container | Host-DNS, sonst `1.1.1.1` |
 | `--password PW` | Root-Passwort des CT | zufaellig |
 | `--ssh-key PATH` | SSH-Public-Key installieren | – |
 | `--novnc-password PW` | noVNC-Passwort setzen | zufaellig/beibehalten |
@@ -243,9 +244,23 @@ Alternativ `--template-store` auf einen Storage mit `vztmpl`-Content setzen.
 ### DNS/Internet im Container fehlt
 
 ```bash
-pct exec 150 -- getent hosts github.com
+cat /etc/resolv.conf
+resolvectl status 2>/dev/null | head -20
 pct exec 150 -- cat /etc/resolv.conf
+pct exec 150 -- getent hosts deb.debian.org
 ```
+
+Zeigt die Datei im Container `nameserver 127.0.0.53`, ist der Host-Resolver
+gemeint, der im LXC nicht erreichbar ist. Der Installer erkennt das und setzt
+automatisch einen passenden Nameserver. Manuell:
+
+```bash
+pct set 150 --nameserver 1.1.1.1
+pct exec 150 -- sh -c 'printf "nameserver 1.1.1.1\nnameserver 9.9.9.9\n" > /etc/resolv.conf'
+pct exec 150 -- getent hosts deb.debian.org
+```
+
+Danach `bash install/bimcraft.sh --ctid 150 --update` erneut ausfuehren.
 
 ### SHA-256-Mismatch beim .deb
 
@@ -296,6 +311,8 @@ Aufrufstapel, Unit-Status, Journal und Provision-Log aus.
   `docker restart`.
 - Host-Script mit gemockten `pct`/`pvesh`/`pvesm`/`pveam` gegen den echten
   Container: Reuse-/Update-Pfad zweimal, Neu-Anlage-Pfad, Hostname-Schutz.
+- DNS-Fallback: absichtlich defekte `resolv.conf` (`127.0.0.53`) wird erkannt und
+  durch einen funktionierenden Nameserver ersetzt.
 - `bash -n`, `shellcheck -S warning` und `systemd-analyze verify` sind sauber.
 
 Details und Log-Auszuege: [docs/test-evidence.md](docs/test-evidence.md).
