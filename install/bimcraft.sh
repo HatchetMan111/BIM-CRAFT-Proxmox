@@ -512,7 +512,10 @@ ensure_dns() {
 resolve_mirror_ips() {
   local host ip
   MIRROR_IPS=""
-  for host in deb.debian.org security.debian.org github.com; do
+  # github.com allein reicht nicht: Release-Downloads werden zu diesen
+  # CDN-Hosts weitergeleitet und brauchen ebenfalls einen Pin.
+  for host in deb.debian.org security.debian.org github.com \
+              objects.githubusercontent.com release-assets.githubusercontent.com; do
     ip="$(getent ahostsv4 "$host" 2>/dev/null | awk '{print $1; exit}')"
     [[ -n "$ip" ]] || return 1
     MIRROR_IPS+="${host}=${ip} "
@@ -625,13 +628,15 @@ write_resolv_conf() {
 apply_mirror_hosts() {
   [[ -n "$MIRROR_IPS" ]] || return 0
   local pair host ip
-  # Entferne alte bimcraft-mirror-pin Einträge
+  # /etc/hosts ist in LXC ein Bind-Mount: mv/sed -i (Rename) schlagen fehl,
+  # deshalb in-place schreiben statt Datei zu ersetzen.
   grep -v "# bimcraft-mirror-pin" /etc/hosts > /tmp/bimcraft-hosts.tmp 2>/dev/null || true
   for pair in $MIRROR_IPS; do
     host="${pair%%=*}"; ip="${pair#*=}"
     echo "${ip} ${host} # bimcraft-mirror-pin" >> /tmp/bimcraft-hosts.tmp
   done
-  mv /tmp/bimcraft-hosts.tmp /etc/hosts
+  cat /tmp/bimcraft-hosts.tmp > /etc/hosts
+  rm -f /tmp/bimcraft-hosts.tmp
   msg_ok "Mirror-Hostnames in /etc/hosts gepinnt (bypasses Container-DNS)."
 }
 
@@ -666,12 +671,12 @@ ensure_container_dns() {
 apply_mirror_hosts
 
 apt_update() {
-  apt-get -qq -o Acquire::ForceIPv4=true -o Acquire::Retries=3 -o Acquire::http::Timeout=20 update
+  apt-get -qq -o Acquire::ForceIPv4=true -o Acquire::Retries=10 -o Acquire::http::Timeout=20 update
 }
 
 apt_install() {
   apt-get install -y --no-install-recommends \
-    -o Acquire::ForceIPv4=true -o Acquire::Retries=3 -o Acquire::http::Timeout=20 "$@"
+    -o Acquire::ForceIPv4=true -o Acquire::Retries=10 -o Acquire::http::Timeout=20 "$@"
 }
 
 ensure_container_dns
@@ -1141,7 +1146,12 @@ msg_info "Starte Container ..."
 start_ct
 wait_for_ip
 ensure_dns
-resolve_mirror_ips
+if resolve_mirror_ips; then
+  msg_ok "Mirror-IPs aufgeloest: ${MIRROR_IPS% }"
+else
+  msg_warn "Konnte Mirror-IPs nicht aufloesen – fahre ohne /etc/hosts-Pinning fort."
+  MIRROR_IPS=""
+fi
 install_ssh_key
 
 provision_ct
