@@ -154,6 +154,14 @@ on_error() {
     msg_error "--- pct status ${CTID} ---"
     pct status "${CTID}" 2>&1 || true
     echo ""
+    msg_error "--- /etc/resolv.conf im Container ---"
+    pct exec "${CTID}" -- cat /etc/resolv.conf 2>&1 || true
+    echo ""
+    msg_error "--- getent ahostsv4 deb.debian.org im Container ---"
+    pct exec "${CTID}" -- getent ahostsv4 deb.debian.org 2>&1 || true
+    echo ""
+    msg_error "--- ping 1.1.1.1 im Container ---"
+    pct exec "${CTID}" -- ping -c 2 -W 3 1.1.1.1 2>&1 || true
     local unit
     for unit in bimcraft-xvfb bimcraft-app bimcraft-vnc bimcraft-web; do
       msg_error "--- systemctl status ${unit} ---"
@@ -285,6 +293,7 @@ if [[ -n "$DNS_SERVER" ]]; then
   [[ "$DNS_SERVER" =~ ^[0-9a-fA-F:.]+$ ]] || die "--nameserver ungueltig: $DNS_SERVER"
 fi
 [[ -n "$DNS_SERVER" ]] || DNS_SERVER="$(detect_nameserver)"
+MIRROR_IPS=""
 
 if [[ "$UNINSTALL" != "1" ]]; then
   (( CORES >= MIN_CORES )) || die "vCPU zu klein: $CORES (Minimum $MIN_CORES, empfohlen $DEFAULT_CORES)."
@@ -500,6 +509,17 @@ ensure_dns() {
   die "DNS im Container nicht erreichbar (Nameserver ${DNS_SERVER}, deb.debian.org)."
 }
 
+resolve_mirror_ips() {
+  local host ip
+  MIRROR_IPS=""
+  for host in deb.debian.org security.debian.org github.com; do
+    ip="$(getent ahostsv4 "$host" 2>/dev/null | awk '{print $1; exit}')"
+    [[ -n "$ip" ]] || return 1
+    MIRROR_IPS+="${host}=${ip} "
+  done
+  return 0
+}
+
 install_ssh_key() {
   [[ -n "$SSH_KEY_ARG" ]] || return 0
   pct exec "$CTID" -- mkdir -p /root/.ssh
@@ -525,6 +545,7 @@ DEBUG="${BIMCRAFT_DEBUG:-0}"
 WEB_PORT="${BIMCRAFT_WEB_PORT:-6080}"
 VNC_PORT="${BIMCRAFT_VNC_PORT:-5900}"
 DNS_SERVER="${BIMCRAFT_DNS:-}"
+MIRROR_IPS="${BIMCRAFT_MIRROR_IPS:-}"
 LOG_FILE="/var/log/bimcraft-provision.log"
 
 mkdir -p /var/log
@@ -595,10 +616,23 @@ container_dns_ok() {
 write_resolv_conf() {
   local ns="${DNS_SERVER:-1.1.1.1}"
   {
-    printf 'nameserver %s\n' "$ns"
-    [[ "$ns" == "1.1.1.1" ]] || printf 'nameserver 1.1.1.1\n'
+    printf 'nameserver 1.1.1.1\n'
+    [[ "$ns" == "1.1.1.1" ]] || printf 'nameserver %s\n' "$ns"
     [[ "$ns" == "9.9.9.9" ]] || printf 'nameserver 9.9.9.9\n'
   } > /etc/resolv.conf
+}
+
+apply_mirror_hosts() {
+  [[ -n "$MIRROR_IPS" ]] || return 0
+  local pair host ip
+  # Entferne alte bimcraft-mirror-pin Einträge
+  grep -v "# bimcraft-mirror-pin" /etc/hosts > /tmp/bimcraft-hosts.tmp 2>/dev/null || true
+  for pair in $MIRROR_IPS; do
+    host="${pair%%=*}"; ip="${pair#*=}"
+    echo "${ip} ${host} # bimcraft-mirror-pin" >> /tmp/bimcraft-hosts.tmp
+  done
+  mv /tmp/bimcraft-hosts.tmp /etc/hosts
+  msg_ok "Mirror-Hostnames in /etc/hosts gepinnt (bypasses Container-DNS)."
 }
 
 repair_container_dns() {
@@ -616,6 +650,8 @@ repair_container_dns() {
   cat /etc/resolv.conf >&2 || true
   msg_error "--- getent ahostsv4 deb.debian.org ---"
   getent ahostsv4 deb.debian.org >&2 || true
+  msg_error "--- ping 1.1.1.1 (Netzwerk-Test) ---"
+  ping -c 2 -W 2 1.1.1.1 >&2 || true
   die "DNS im Container nicht erreichbar (Nameserver ${ns}, deb.debian.org)."
 }
 
@@ -626,6 +662,8 @@ ensure_container_dns() {
   fi
   repair_container_dns
 }
+
+apply_mirror_hosts
 
 apt_update() {
   apt-get -qq -o Acquire::ForceIPv4=true -o Acquire::Retries=3 -o Acquire::http::Timeout=20 update
@@ -933,6 +971,7 @@ provision_ct() {
     "BIMCRAFT_WEB_PORT=$WEB_PORT" \
     "BIMCRAFT_VNC_PORT=$VNC_PORT" \
     "BIMCRAFT_DNS=$DNS_SERVER" \
+    "BIMCRAFT_MIRROR_IPS=$MIRROR_IPS" \
     bash /root/bimcraft-provision.sh
   if [[ "$xtrace_was_on" == "1" ]]; then
     set -x
@@ -1102,6 +1141,7 @@ msg_info "Starte Container ..."
 start_ct
 wait_for_ip
 ensure_dns
+resolve_mirror_ips
 install_ssh_key
 
 provision_ct
