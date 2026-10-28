@@ -510,16 +510,17 @@ ensure_dns() {
 }
 
 resolve_mirror_ips() {
+  # Pro Host pinnen, nicht all-or-nothing: ein einziger DNS-Fehler soll
+  # nicht saemtliche Pins verlieren.
   local host ip
   MIRROR_IPS=""
-  # github.com allein reicht nicht: Release-Downloads werden zu diesen
-  # CDN-Hosts weitergeleitet und brauchen ebenfalls einen Pin.
   for host in deb.debian.org security.debian.org github.com \
               objects.githubusercontent.com release-assets.githubusercontent.com; do
     ip="$(getent ahostsv4 "$host" 2>/dev/null | awk '{print $1; exit}')"
-    [[ -n "$ip" ]] || return 1
+    [[ -n "$ip" ]] || { msg_warn "Mirror-Host '${host}' konnte auf dem Host nicht aufgeloest werden."; continue; }
     MIRROR_IPS+="${host}=${ip} "
   done
+  [[ -n "$MIRROR_IPS" ]] || return 1
   return 0
 }
 
@@ -673,19 +674,30 @@ resolve_mirror_ips_in_container() {
   # Container loest die Mirror-Hosts selbst auf (DNS-Check ist zu dem
   # Zeitpunkt gerade bestanden) und pinnt sie in /etc/hosts. Damit wird
   # apt von DNS-Transientfehlern waehrend der Paket-Downloads entkoppelt.
+  # Pro Host pinnen, nicht all-or-nothing.
   local host ip attempt
   for attempt in 1 2 3; do
     MIRROR_IPS=""
     for host in deb.debian.org security.debian.org github.com \
                 objects.githubusercontent.com release-assets.githubusercontent.com; do
       ip="$(getent ahostsv4 "$host" 2>/dev/null | awk '{print $1; exit}')"
-      [[ -n "$ip" ]] || { MIRROR_IPS=""; break; }
+      [[ -n "$ip" ]] || continue
       MIRROR_IPS+="${host}=${ip} "
     done
     [[ -n "$MIRROR_IPS" ]] && return 0
     sleep 2
   done
   return 1
+}
+
+ensure_mirror_pins_ready() {
+  # apt braucht mindestens deb.debian.org und security.debian.org gepinnt;
+  # sonst ist DNS-Flakiness wieder im Spiel.
+  local host
+  for host in deb.debian.org security.debian.org; do
+    grep -qE "^[^#]+[[:space:]]${host}[[:space:]]*#" /etc/hosts || return 1
+  done
+  return 0
 }
 
 apt_update() {
@@ -706,6 +718,23 @@ elif [[ -z "$MIRROR_IPS" ]]; then
   MIRROR_IPS=""
 fi
 apply_mirror_hosts
+
+# Verifikation: apt braucht mindestens deb.debian.org und security.debian.org
+# gepinnt; sonst ist DNS-Flakiness wieder im Spiel.
+if ! ensure_mirror_pins_ready; then
+  msg_warn "Pins fuer deb.debian.org/security.debian.org fehlen – nochmal auflösen ..."
+  if resolve_mirror_ips_in_container; then
+    apply_mirror_hosts
+  fi
+fi
+if ! ensure_mirror_pins_ready; then
+  msg_error "--- /etc/hosts ---"
+  cat /etc/hosts >&2 || true
+  msg_error "--- getent ahostsv4 deb.debian.org ---"
+  getent ahostsv4 deb.debian.org >&2 || true
+  die "Kritische Mirror-Pins fehlen – apt wuerde an DNS scheitern."
+fi
+msg_ok "Mirror-Pins aktiv (deb.debian.org, security.debian.org)."
 
 msg_info "Installiere Systemabhaengigkeiten ..."
 for attempt in 1 2 3; do
