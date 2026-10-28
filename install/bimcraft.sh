@@ -570,6 +570,10 @@ on_error() {
   safe_cmd="$cmd"
   [[ -n "${PASSWORD:-}" ]] && safe_cmd="${safe_cmd//"$PASSWORD"/***}"
   [[ -n "${NOVNC_PASSWORD:-}" ]] && safe_cmd="${safe_cmd//"$NOVNC_PASSWORD"/***}"
+  # NSS-Zuruecksetzung, falls wir waehrend apt auf 'hosts: files' waren.
+  if [[ -n "${ORIG_HOSTS_LINE:-}" ]]; then
+    sed -i "s|^hosts:.*|$ORIG_HOSTS_LINE|" /etc/nsswitch.conf 2>/dev/null || true
+  fi
   echo ""
   msg_error "════════ PROVISIONIERUNG IM CONTAINER FEHLGESCHLAGEN ════════"
   msg_error "Befehl    : $safe_cmd"
@@ -736,6 +740,26 @@ if ! ensure_mirror_pins_ready; then
 fi
 msg_ok "Mirror-Pins aktiv (deb.debian.org, security.debian.org)."
 
+# Waehrend apt DNS komplett ignorieren lassen: NSS nur ueber /etc/hosts.
+# Grund: auf dem Ziel-Host resolve apt trotz vorhandener /etc/hosts-Eintraege
+# ueber DNS und scheitert an transientem DNS. Mit 'hosts: files' ist apt
+# garantiert an die Pins gebunden.
+ORIG_HOSTS_LINE="$(grep -E '^hosts:' /etc/nsswitch.conf 2>/dev/null || true)"
+force_hosts_files() {
+  if grep -q '^hosts:' /etc/nsswitch.conf 2>/dev/null; then
+    sed -i 's/^hosts:.*/hosts: files/' /etc/nsswitch.conf
+  else
+    printf 'hosts: files\n' >> /etc/nsswitch.conf
+  fi
+  msg_ok "NSS: hosts-lookup auf 'files' umgestellt (DNS waehrend apt ignoriert)."
+}
+restore_hosts_line() {
+  if [[ -n "$ORIG_HOSTS_LINE" ]]; then
+    sed -i "s|^hosts:.*|$ORIG_HOSTS_LINE|" /etc/nsswitch.conf
+  fi
+}
+force_hosts_files
+
 msg_info "Installiere Systemabhaengigkeiten ..."
 for attempt in 1 2 3; do
   if apt_update; then break; fi
@@ -764,6 +788,8 @@ for attempt in 1 2 3; do
   sleep 5
 done
 msg_ok "Systempakete installiert."
+restore_hosts_line
+msg_ok "NSS hosts-lookup wiederhergestellt."
 
 if [[ "$(dpkg --print-architecture)" != "amd64" ]]; then
   die "Container-Architektur ist $(dpkg --print-architecture), erwartet amd64/x86_64."
