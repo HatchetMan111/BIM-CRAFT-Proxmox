@@ -668,7 +668,25 @@ ensure_container_dns() {
   repair_container_dns
 }
 
-apply_mirror_hosts
+resolve_mirror_ips_in_container() {
+  # Fallback, wenn die Host-seitige Aufloesung leer geblieben ist: der
+  # Container loest die Mirror-Hosts selbst auf (DNS-Check ist zu dem
+  # Zeitpunkt gerade bestanden) und pinnt sie in /etc/hosts. Damit wird
+  # apt von DNS-Transientfehlern waehrend der Paket-Downloads entkoppelt.
+  local host ip attempt
+  for attempt in 1 2 3; do
+    MIRROR_IPS=""
+    for host in deb.debian.org security.debian.org github.com \
+                objects.githubusercontent.com release-assets.githubusercontent.com; do
+      ip="$(getent ahostsv4 "$host" 2>/dev/null | awk '{print $1; exit}')"
+      [[ -n "$ip" ]] || { MIRROR_IPS=""; break; }
+      MIRROR_IPS+="${host}=${ip} "
+    done
+    [[ -n "$MIRROR_IPS" ]] && return 0
+    sleep 2
+  done
+  return 1
+}
 
 apt_update() {
   apt-get -qq -o Acquire::ForceIPv4=true -o Acquire::Retries=10 -o Acquire::http::Timeout=20 update
@@ -680,6 +698,14 @@ apt_install() {
 }
 
 ensure_container_dns
+
+if [[ -z "$MIRROR_IPS" ]] && resolve_mirror_ips_in_container; then
+  msg_ok "Mirror-IPs im Container aufgeloest: ${MIRROR_IPS% }"
+elif [[ -z "$MIRROR_IPS" ]]; then
+  msg_warn "Konnte Mirror-IPs im Container nicht aufloesen – fahre ohne /etc/hosts-Pinning fort."
+  MIRROR_IPS=""
+fi
+apply_mirror_hosts
 
 msg_info "Installiere Systemabhaengigkeiten ..."
 for attempt in 1 2 3; do
