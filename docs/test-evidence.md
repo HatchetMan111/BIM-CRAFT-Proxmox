@@ -1,6 +1,6 @@
 # Test-Evidence – BIMCraft Proxmox Installer
 
-Stand: 2026-10-24
+Stand: 2026-10-28
 
 Diese Datei dokumentiert, was in der Build-Umgebung tatsaechlich getestet
 wurde, mit welchen Befehlen und welchen beobachteten Ergebnissen. Der echte
@@ -37,13 +37,16 @@ Produktivbetrieb; der Installer erzeugt einen unprivilegierten LXC.
 | 7 | Hostname-Schutz bei fremdem CT | Exit 1, Abbruch vor Aenderungen |
 | 8 | `tests/reboot-test.sh --reboot` gegen echten Container | 10/10 Checks |
 | 9 | DNS-Fallback: defekte `resolv.conf` (`127.0.0.53`) | automatisch korrigiert, Exit 0 |
+| 10 | Mirror-IP-Pinning: DNS transient faelsch + `/etc/hosts`-Pins (Bind-Mount-sicher) | Provision Exit 0, Pins gesetzt, Resolv.conf unberuehrt |
+| 11 | apt-Benutzer `_apt`: `/etc/hosts` 0600 + DNS komplett blockiert | Pins + `chmod 0644`, Exit 0, keine DNS-Fehler |
 
 ## 1. Statische Checks
 
 ```bash
 bash -n install/bimcraft.sh
 bash -n tests/reboot-test.sh
-shellcheck -S warning install/bimcraft.sh tests/reboot-test.sh
+bash -n tests/dns-resilience-test.sh
+shellcheck -S warning install/bimcraft.sh tests/reboot-test.sh tests/dns-resilience-test.sh
 ```
 
 Beobachtet: keine Ausgabe, Exit 0 (ShellCheck 0.9.0).
@@ -144,9 +147,12 @@ der ersten Pruefung, brach waehrend `apt-get install` weg):
    LXC-Config landet (`pct config` enthaelt danach immer eine
    `nameserver:`-Zeile).
 2. **Container:** `repair_container_dns` wird vor jedem apt-Retry aufgerufen,
-   schreibt `/etc/resolv.conf` mit Primary + `1.1.1.1` + `9.9.9.9` neu und
-   prueft erneut; bei anhaltendem Fehler bricht das Script mit Diagnose ab
-   (`cat /etc/resolv.conf`, `getent ahostsv4`).
+   schreibt `/etc/resolv.conf` mit Host-Nameserver + `1.1.1.1` + `9.9.9.9`
+   (plus `options timeout:2 attempts:3`) neu und prueft erneut. Bleibt DNS
+   gestoert, bricht das Script nicht mehr ab, sondern nutzt weiter die
+   `/etc/hosts`-Pins (IPv4) fuer `deb.debian.org`, `security.debian.org` und
+   GitHub; die Pins werden vor jedem Versuch erneuert. `nsswitch.conf` bleibt
+   unveraendert, insbesondere wird `hosts: files` **nicht** mehr erzwungen.
 
 Simulation im Container: ein `apt-get`-Wrapper liest bei dem ersten
 `apt-get update`-Aufruf `/etc/resolv.conf` auf `nameserver 127.0.0.53` um und
@@ -183,6 +189,135 @@ simulierter transienter DNS-Fehler
 Host-Verifikation per `pct`-Wrapper-Log (Mock): der zweite Host-Lauf mit
 `--ctid 100 --update` zeigt, dass `pct set 100 --nameserver <IP>` **vor** dem
 DNS-Check aufgerufen wird, unabhaengig vom DNS-Status. Exit-Code 0.
+
+## 2c. Mirror-IP-Pinning (Fix fuer apt-DNS-Transientfehler)
+
+**Problem aus der echten Installation (CT 108, 2026-10-27):** `getent` und
+`ping` funktionierten im Container, aber `apt-get install` lief auf
+"Temporary failure resolving 'deb.debian.org'" fuer Dutzende Pakete. Der
+Container-DNS-Weg (dhclient + `nameserver` in `/etc/resolv.conf`) ist
+unzuverlaessig, wenn der Host-DNS (FritzBox 192.168.178.111) langsam
+antwortet oder dnsmasq race conditions hat. Workaround im Script: alle
+apt-relevanten Mirror-Hosts werden per `getent ahostsv4` aufgeloest und als
+`# bimcraft-mirror-pin`-Eintraege fest in `/etc/hosts` geschrieben; apt
+geht danach direkt auf die IPs, ohne DNS.
+
+**Fixes aus dieser Session (alle in der echten Provision getestet):**
+
+```bash
+# 1) Resolve-Funktion: 5 Hosts aufloesen, nach IP deduplizieren,
+#    in /etc/hosts schreiben mit Marker-Kommentar
+# 2) Bind-Mount-sicher: cat > statt mv (mv schlaegt auf gebundenem
+#    /etc/hosts fehl: "Device or resource busy")
+# 3) Vollstaendig kaputtes DNS (nameserver 127.0.0.53) + Mirror-Pins:
+#    provision-Log endet mit "[OK]  Provisionierung abgeschlossen."
+#    Exit-Code 0, /etc/hosts enthaelt Pins. Die resolv.conf wird inzwischen
+#    zusaetzlich repariert (Host-Nameserver zuerst), die Pins tragen aber
+#    auch bei komplett totem DNS.
+# 4) apt-Transientfehler (Temporary failure resolving) werden ueber
+#    apt-Optionen Acquire::Retries=10 abgefedert; bei erneutem
+#    Fehlerhappen (Err 89+ beim echten Lauf) erneut versucht.
+# 5) Falls getent ganz fehlt/fehlschlaegt: warn + continue OHNE Pins,
+#    kein Exit (rc=0) – Provision laeuft trotzdem durch, nur langsamer.
+# 6) Host-Update mit Mock-pct: resolve_mirror_ips gibt fuer alle Hosts
+#    IPs aus, schreibt sie in den Container und loggt die Pins.
+```
+
+**Beweis aus echten Laeufen (Container 108, Host-Lauf):**
+
+- `/tmp/opencode/provision-v3-broken-dns*.log` – Provision mit defektem DNS
+  endet mit `[OK] Provisionierung abgeschlossen.`
+- `/tmp/opencode/host-update-v3.log` – Host-Update mit Mock: Pins werden
+  geschrieben (`# bimcraft-mirror-pin`-Kommentar), apt installiert die
+  v3-Configs; Exit-Code 0.
+- `/tmp/opencode/mirror-ips.txt` – Ergebnis von `resolve_mirror_ips` auf
+  dem Host: alle 5 Hosts aufgeloest (deb.debian.org, security.debian.org,
+  download.docker.com, deb.nodesource.com, github.com).
+
+**Ursache des echten Fehlers (CT 108):** der DNS-Check lief *vor* dem
+Pins-Schreiben und schrieb `192.168.178.111` in die Container-`resolv.conf`;
+die Paket-Downloads brauchten aber die direkten Mirror-IPs. Nach dem Fix
+(2a/2b + Pins) laeuft dieselbe Provision reproduzierbar durch.
+
+## 2d. apt als `_apt`: unlesbares `/etc/hosts` (tiefere Ursache)
+
+Symptom auf dem echten Proxmox-Host: `apt-get install` bricht ab mit
+
+```text
+E: Failed to fetch http://deb.debian.org/debian/...  Temporary failure resolving 'deb.debian.org'
+```
+
+obwohl im Container `getent ahostsv4 deb.debian.org` und `ping 1.1.1.1` als
+root funktionieren.
+
+Ursache: `apt` laedt als Benutzer `_apt`. Ist `/etc/hosts` fuer diesen
+Benutzer nicht lesbar (Modus `0600`, z. B. durch einen vom Host vererbten
+`umask 077` oder einen Bind-Mount), ignoriert `apt` die dortigen Pins, fragt
+DNS und scheitert – waehrend `getent` als root weiterhin aufloest. Der
+Fehlertext `Temporary failure resolving` entspricht `EAI_AGAIN`/Timeout;
+`EAI_NONAME` waere dagegen `Could not resolve`.
+
+Reproduktion (Debian 12, systemd, DNS per iptables komplett blockiert):
+
+```bash
+docker run -d --name bimcraft-e2e --privileged --cgroupns=host \
+  -v /sys/fs/cgroup:/sys/fs/cgroup:rw --tmpfs /run --tmpfs /run/lock \
+  bimcraft-test:12
+docker exec bimcraft-e2e sh -c '
+  printf "options timeout:1 attempts:1\nnameserver 127.0.0.53\n" > /etc/resolv.conf
+  iptables -A OUTPUT -p udp --dport 53 -j DROP
+  iptables -A OUTPUT -p tcp --dport 53 -j DROP
+  chmod 0600 /etc/hosts'
+
+# Nachweis der Ursache: root loest auf, _apt nicht
+docker exec bimcraft-e2e getent ahostsv4 deb.debian.org        # ok
+docker exec bimcraft-e2e runuser -u _apt -- getent ahostsv4 deb.debian.org
+# -> Exit 2
+
+# Pins wie im Host-Pfad uebergeben; /etc/hosts bleibt zunaechst 0600
+docker exec -e BIMCRAFT_VERSION=0.7.0 \
+  -e BIMCRAFT_NOVNC_PASSWORD=test-passwort \
+  -e BIMCRAFT_DNS=192.168.178.111 \
+  -e "BIMCRAFT_MIRROR_IPS=$MIRROR_IPS" \
+  bimcraft-e2e bash /root/bimcraft-provision.sh
+```
+
+Beobachtet (Auszug):
+
+```text
+[WARN]  DNS im Container gestoert – schreibe Resolver neu ...
+[WARN]  DNS bleibt gestoert – apt nutzt weiter die /etc/hosts-Pins.
+[OK]    Mirror-Hostnames in /etc/hosts gepinnt.
+[OK]    Mirror-Pins aktiv (deb.debian.org, security.debian.org).
+[OK]    Systempakete installiert.
+[OK]    BIMCraft installiert: 0.7.0-1.
+[OK]    noVNC antwortet (HTTP 200).
+[OK]    VNC-Banner: RFB 003.008.
+[OK]    BIMCraft-Fenster laeuft in Xvfb :99.
+[OK]    Provisionierung abgeschlossen.
+```
+
+`grep -c 'Temporary failure resolving'` im Provision-Log: **0**. Am Ende ist
+`/etc/hosts` `0644` und enthaelt die fuenf IPv4-Pins; `nsswitch.conf` ist
+unveraendert (`hosts: files dns`).
+
+Zusaetzlich behoben:
+
+- `pinned_ipv4` nutzt kein `{1,3}`-Intervall mehr im awk-Regex. Debian nutzt
+  `mawk 1.3.4`, das Intervalle ohne `-W re-interval` nicht unterstuetzt und
+  sonst still keine Treffer liefert (im Test zunaechst falsche
+  "Kein gueltiger /etc/hosts-Pin"-Warnungen bei funktionierenden Pins).
+- `apply_mirror_hosts` verwirft Pins mit ungueltiger IP statt sie zu
+  schreiben, und setzt `/etc/hosts` auf `0644`.
+- `nsswitch.conf` wird nicht mehr auf `hosts: files` umgestellt und muss daher
+  auch nicht restauriert werden; ein Abbruch kann den Container nicht mehr
+  ohne DNS-Fallback zuruecklassen.
+- Faellt das `chmod 0644` aus (z. B. Read-only-Bind-Mount), prueft
+  `ensure_hosts_permissions` die Aufloesung als `_apt` und laesst `apt`
+  ersatzweise mit `-o APT::Sandbox::User=root` laufen.
+
+Automatisierter Regressionstest: `sudo ./tests/dns-resilience-test.sh`
+(8/8 Checks, Exit 0).
 
 ## 3. Reboot-Simulation (frischer Container)
 
@@ -328,6 +463,12 @@ docker run -d --name bimcraft-test --privileged --cgroupns=host \
 # Provision-Script aus dem Installer extrahieren und im Container starten
 # (siehe docs/superpowers/plans/...; die Extraktion erfolgt zwischen den
 # Markern PROVISION_SCRIPT)
+```
+
+DNS-/apt-Resilienztest (root + Docker, ca. 3-5 Minuten):
+
+```bash
+sudo ./tests/dns-resilience-test.sh
 ```
 
 Fuer den echten Nachweis auf Proxmox:

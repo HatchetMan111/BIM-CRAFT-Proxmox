@@ -262,6 +262,23 @@ pct exec 150 -- getent hosts deb.debian.org
 
 Danach `bash install/bimcraft.sh --ctid 150 --update` erneut ausfuehren.
 
+Wichtig: `getent`/`ping` als root koennen funktionieren, waehrend `apt` mit
+`Temporary failure resolving 'deb.debian.org'` scheitert. `apt` laedt als
+Benutzer `_apt`; kann der `/etc/hosts` nicht lesen (z. B. Modus `0600` durch
+einen vererbten `umask` oder einen Bind-Mount), ignoriert er die dortigen
+Eintraege und fragt DNS. Pruefen:
+
+```bash
+pct exec 150 -- ls -l /etc/hosts /etc/nsswitch.conf
+pct exec 150 -- runuser -u _apt -- getent hosts deb.debian.org
+pct exec 150 -- sh -c 'chmod 0644 /etc/hosts'
+```
+
+Der Installer setzt `umask 022`, macht `/etc/hosts` fuer `_apt` lesbar und
+pinnt die Mirror-Hosts als IPv4 in `/etc/hosts`; `nsswitch.conf` bleibt
+unveraendert (`hosts: files dns`). Schlaegt das `chmod` fehl, laeuft `apt`
+ersatzweise mit `-o APT::Sandbox::User=root`.
+
 ### SHA-256-Mismatch beim .deb
 
 Das Release-Asset passt nicht zur `SHA256SUMS`-Datei. Pruefe die Version:
@@ -313,6 +330,9 @@ Aufrufstapel, Unit-Status, Journal und Provision-Log aus.
   Container: Reuse-/Update-Pfad zweimal, Neu-Anlage-Pfad, Hostname-Schutz.
 - DNS-Fallback: absichtlich defekte `resolv.conf` (`127.0.0.53`) wird erkannt und
   durch einen funktionierenden Nameserver ersetzt.
+- apt-Benutzer `_apt` mit unlesbarem `/etc/hosts` (`0600`) bei komplett
+  blockiertem DNS: IPv4-Pins + `chmod 0644`, Exit 0, keine
+  `Temporary failure resolving`-Fehler.
 - `bash -n`, `shellcheck -S warning` und `systemd-analyze verify` sind sauber.
 
 Details und Log-Auszuege: [docs/test-evidence.md](docs/test-evidence.md).
@@ -328,6 +348,7 @@ lassen.
 install/bimcraft.sh        Host-Installer inkl. eingebettetem Provision-Script
 systemd/                   Die vier systemd-Units (Referenz)
 tests/reboot-test.sh       Reboot-/Health-Test auf dem Proxmox-Host
+tests/dns-resilience-test.sh  DNS-/apt-Resilienztest in Docker (root)
 docs/test-evidence.md      Testmatrix und Log-Auszuege
 docs/superpowers/          Design-Spec und Implementierungsplan
 ```

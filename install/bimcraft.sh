@@ -160,6 +160,16 @@ on_error() {
     msg_error "--- getent ahostsv4 deb.debian.org im Container ---"
     pct exec "${CTID}" -- getent ahostsv4 deb.debian.org 2>&1 || true
     echo ""
+    msg_error "--- getent als _apt im Container (entscheidend fuer apt) ---"
+    pct exec "${CTID}" -- runuser -u _apt -- getent ahostsv4 deb.debian.org 2>&1 || true
+    echo ""
+    msg_error "--- /etc/hosts (Rechte + Inhalt) im Container ---"
+    pct exec "${CTID}" -- ls -l /etc/hosts /etc/nsswitch.conf /etc/resolv.conf 2>&1 || true
+    pct exec "${CTID}" -- cat /etc/hosts 2>&1 || true
+    echo ""
+    msg_error "--- hosts-Zeile in /etc/nsswitch.conf ---"
+    pct exec "${CTID}" -- grep -E '^hosts:' /etc/nsswitch.conf 2>&1 || true
+    echo ""
     msg_error "--- ping 1.1.1.1 im Container ---"
     pct exec "${CTID}" -- ping -c 2 -W 3 1.1.1.1 2>&1 || true
     local unit
@@ -171,8 +181,10 @@ on_error() {
       pct exec "${CTID}" -- journalctl -u "${unit}" --no-pager -n 80 2>&1 || true
       echo ""
     done
-    msg_error "--- HTTP-Check im Container ---"
-    pct exec "${CTID}" -- curl -sS -o /dev/null -w 'HTTP %{http_code}\n' "http://127.0.0.1:${WEB_PORT}/vnc.html" 2>&1 || true
+    msg_error "--- HTTP-Check im Container (curl ist bei apt-Fehler evtl. nicht installiert) ---"
+    pct exec "${CTID}" -- bash -c "exec 3<>/dev/tcp/127.0.0.1/${WEB_PORT}" 2>&1 \
+      && msg_error "TCP-Port ${WEB_PORT} ist offen." \
+      || msg_error "TCP-Port ${WEB_PORT} ist nicht erreichbar."
     echo ""
     msg_error "--- Provision-Log (letzte 100 Zeilen) ---"
     pct exec "${CTID}" -- tail -n 100 /var/log/bimcraft-provision.log 2>&1 || true
@@ -539,6 +551,10 @@ write_provision_script() {
   cat >"$PROVISION_TMP" <<'PROVISION_SCRIPT'
 #!/usr/bin/env bash
 set -Eeuo pipefail
+# Nicht den umask des Host-Prozesses erben (pct exec kann ihn durchreichen):
+# sonst entstehen 0600-Dateien wie /etc/hosts, die der apt-Benutzer _apt
+# nicht mehr lesen kann. Geheime Dateien werden spaeter gezielt 0600 gesetzt.
+umask 022
 
 APP_USER="bimcraft"
 APP_HOME="/home/bimcraft"
@@ -570,10 +586,6 @@ on_error() {
   safe_cmd="$cmd"
   [[ -n "${PASSWORD:-}" ]] && safe_cmd="${safe_cmd//"$PASSWORD"/***}"
   [[ -n "${NOVNC_PASSWORD:-}" ]] && safe_cmd="${safe_cmd//"$NOVNC_PASSWORD"/***}"
-  # NSS-Zuruecksetzung, falls wir waehrend apt auf 'hosts: files' waren.
-  if [[ -n "${ORIG_HOSTS_LINE:-}" ]]; then
-    sed -i "s|^hosts:.*|$ORIG_HOSTS_LINE|" /etc/nsswitch.conf 2>/dev/null || true
-  fi
   echo ""
   msg_error "════════ PROVISIONIERUNG IM CONTAINER FEHLGESCHLAGEN ════════"
   msg_error "Befehl    : $safe_cmd"
@@ -581,6 +593,21 @@ on_error() {
   msg_error "Exit-Code : $exit_code"
   msg_error "Stack     : ${FUNCNAME[*]:-main}"
   msg_error "Logdatei  : $LOG_FILE"
+  echo ""
+  msg_error "--- Dateirechte (apt braucht lesbares /etc/hosts) ---"
+  ls -l /etc/hosts /etc/nsswitch.conf /etc/resolv.conf 2>&1 || true
+  echo ""
+  msg_error "--- /etc/hosts ---"
+  cat /etc/hosts 2>&1 || true
+  echo ""
+  msg_error "--- hosts-Zeile in /etc/nsswitch.conf ---"
+  grep -E '^hosts:' /etc/nsswitch.conf 2>&1 || true
+  echo ""
+  msg_error "--- getent als root ---"
+  getent ahostsv4 deb.debian.org 2>&1 || true
+  echo ""
+  msg_error "--- getent als apt-Benutzer (_apt) ---"
+  timeout 5 runuser -u _apt -- getent ahostsv4 deb.debian.org 2>&1 || true
   echo ""
   for unit in bimcraft-xvfb bimcraft-app bimcraft-vnc bimcraft-web; do
     msg_error "--- systemctl status $unit ---"
@@ -621,48 +648,95 @@ container_dns_ok() {
     && timeout 5 getent ahostsv4 github.com >/dev/null 2>&1
 }
 
+APT_PIN_HOSTS="deb.debian.org security.debian.org github.com objects.githubusercontent.com release-assets.githubusercontent.com"
+APT_NET_OPTS=(-o Acquire::ForceIPv4=true -o Acquire::Retries=10 -o Acquire::http::Timeout=30 -o Acquire::http::Pipeline-Depth=0)
+APT_SANDBOX_ARGS=()
+
+host_ipv4() {
+  getent ahostsv4 "$1" 2>/dev/null | awk '{print $1; exit}'
+}
+
+apt_sandbox_user() {
+  if id -u _apt >/dev/null 2>&1; then printf '_apt'; else printf 'root'; fi
+}
+
+# Kern des Problems: apt laedt als Benutzer _apt. Ist /etc/hosts fuer diesen
+# Benutzer nicht lesbar (z. B. 0600 durch einen vererbten umask oder einen
+# Bind-Mount), ignoriert apt die Pins, fragt DNS und scheitert mit
+# "Temporary failure resolving" – waehrend `getent` als root weiter funktioniert.
+hosts_readable_by_apt() {
+  local u
+  u="$(apt_sandbox_user)"
+  [[ "$u" == "root" ]] && return 0
+  command -v runuser >/dev/null 2>&1 || return 0
+  timeout 5 runuser -u "$u" -- getent ahostsv4 deb.debian.org >/dev/null 2>&1
+}
+
+ensure_hosts_permissions() {
+  hosts_readable_by_apt && return 0
+  chmod 0644 /etc/hosts 2>/dev/null || true
+  if hosts_readable_by_apt; then
+    msg_ok "/etc/hosts fuer den apt-Benutzer lesbar gemacht (0644)."
+    return 0
+  fi
+  # Nur wenn root aufloesen kann, ist es wirklich ein Rechteproblem.
+  if getent ahostsv4 deb.debian.org >/dev/null 2>&1; then
+    APT_SANDBOX_ARGS=(-o APT::Sandbox::User=root)
+    msg_warn "/etc/hosts ist fuer den apt-Benutzer nicht lesbar, fuer root aber schon – apt laeuft ohne Sandbox."
+  fi
+  return 0
+}
+
 write_resolv_conf() {
-  local ns="${DNS_SERVER:-1.1.1.1}"
+  local ns="${DNS_SERVER:-}" out="/etc/resolv.conf"
   {
+    # Der vom Host uebergebene Resolver steht vorn: im LAN ist er meist der
+    # einzige, der zuverlaessig und schnell antwortet.
+    if [[ -n "$ns" && "$ns" != "1.1.1.1" && "$ns" != "9.9.9.9" ]]; then
+      printf 'nameserver %s\n' "$ns"
+    fi
     printf 'nameserver 1.1.1.1\n'
-    [[ "$ns" == "1.1.1.1" ]] || printf 'nameserver %s\n' "$ns"
     [[ "$ns" == "9.9.9.9" ]] || printf 'nameserver 9.9.9.9\n'
-  } > /etc/resolv.conf
+    # Kurze Deadlines: ein toter Nameserver darf apt nicht minutenlang blockieren.
+    printf 'options timeout:2 attempts:3\n'
+  } > "$out"
+  chmod 0644 "$out" 2>/dev/null || true
 }
 
 apply_mirror_hosts() {
   [[ -n "$MIRROR_IPS" ]] || return 0
-  local pair host ip
-  # /etc/hosts ist in LXC ein Bind-Mount: mv/sed -i (Rename) schlagen fehl,
-  # deshalb in-place schreiben statt Datei zu ersetzen.
-  grep -v "# bimcraft-mirror-pin" /etc/hosts > /tmp/bimcraft-hosts.tmp 2>/dev/null || true
+  local pair host ip tmp="/tmp/bimcraft-hosts.tmp"
+  # /etc/hosts ist in LXC oft ein Bind-Mount: mv/sed -i (Rename) schlagen fehl,
+  # deshalb in-place schreiben statt die Datei zu ersetzen.
+  grep -v '# bimcraft-mirror-pin' /etc/hosts > "$tmp" 2>/dev/null || true
+  [[ -s "$tmp" ]] || printf '127.0.0.1 localhost\n::1 localhost\n' > "$tmp"
   for pair in $MIRROR_IPS; do
     host="${pair%%=*}"; ip="${pair#*=}"
-    echo "${ip} ${host} # bimcraft-mirror-pin" >> /tmp/bimcraft-hosts.tmp
+    if [[ ! "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+      msg_warn "Ungueltige Mirror-IP fuer ${host} ('${ip}') – nicht gepinnt."
+      continue
+    fi
+    printf '%s %s # bimcraft-mirror-pin\n' "$ip" "$host" >> "$tmp"
   done
-  cat /tmp/bimcraft-hosts.tmp > /etc/hosts
-  rm -f /tmp/bimcraft-hosts.tmp
-  msg_ok "Mirror-Hostnames in /etc/hosts gepinnt (bypasses Container-DNS)."
+  cat "$tmp" > /etc/hosts
+  rm -f "$tmp"
+  chmod 0644 /etc/hosts 2>/dev/null || true
+  msg_ok "Mirror-Hostnames in /etc/hosts gepinnt."
 }
 
 repair_container_dns() {
-  local i ns="${DNS_SERVER:-1.1.1.1}"
-  msg_warn "DNS im Container defekt – schreibe Nameserver ${ns} und Fallbacks ..."
+  local i ns="${DNS_SERVER:-}"
+  msg_warn "DNS im Container gestoert – schreibe Resolver neu ..."
   write_resolv_conf
-  for i in $(seq 1 15); do
+  for i in $(seq 1 30); do
     if container_dns_ok; then
-      msg_ok "DNS im Container funktioniert (Nameserver ${ns})."
+      msg_ok "DNS im Container funktioniert (Nameserver ${ns:-auto})."
       return 0
     fi
     sleep 2
   done
-  msg_error "--- /etc/resolv.conf ---"
-  cat /etc/resolv.conf >&2 || true
-  msg_error "--- getent ahostsv4 deb.debian.org ---"
-  getent ahostsv4 deb.debian.org >&2 || true
-  msg_error "--- ping 1.1.1.1 (Netzwerk-Test) ---"
-  ping -c 2 -W 2 1.1.1.1 >&2 || true
-  die "DNS im Container nicht erreichbar (Nameserver ${ns}, deb.debian.org)."
+  msg_warn "DNS bleibt gestoert – apt nutzt weiter die /etc/hosts-Pins."
+  return 1
 }
 
 ensure_container_dns() {
@@ -670,7 +744,7 @@ ensure_container_dns() {
     msg_ok "DNS im Container funktioniert (Nameserver ${DNS_SERVER:-auto})."
     return 0
   fi
-  repair_container_dns
+  repair_container_dns || true
 }
 
 resolve_mirror_ips_in_container() {
@@ -682,9 +756,8 @@ resolve_mirror_ips_in_container() {
   local host ip attempt
   for attempt in 1 2 3; do
     MIRROR_IPS=""
-    for host in deb.debian.org security.debian.org github.com \
-                objects.githubusercontent.com release-assets.githubusercontent.com; do
-      ip="$(getent ahostsv4 "$host" 2>/dev/null | awk '{print $1; exit}')"
+    for host in $APT_PIN_HOSTS; do
+      ip="$(host_ipv4 "$host")"
       [[ -n "$ip" ]] || continue
       MIRROR_IPS+="${host}=${ip} "
     done
@@ -694,71 +767,69 @@ resolve_mirror_ips_in_container() {
   return 1
 }
 
+pinned_ipv4() {
+  # Kein {1,3}-Intervall im awk-Regex: Debian nutzt mawk, das Intervalle ohne
+  # -W re-interval nicht unterstuetzt (liefert sonst still keine Treffer).
+  local ip
+  ip="$(awk -v h="$1" '$2 == h && $3 == "#" && $4 == "bimcraft-mirror-pin" {print $1; exit}' /etc/hosts)"
+  [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 0
+  printf '%s\n' "$ip"
+}
+
 ensure_mirror_pins_ready() {
-  # apt braucht mindestens deb.debian.org und security.debian.org gepinnt;
-  # sonst ist DNS-Flakiness wieder im Spiel.
+  # apt braucht mindestens deb.debian.org und security.debian.org als
+  # gueltige, fuer den apt-Benutzer lesbare IPv4-Pins.
   local host
   for host in deb.debian.org security.debian.org; do
-    grep -qE "^[^#]+[[:space:]]${host}[[:space:]]*#" /etc/hosts || return 1
+    if [[ -z "$(pinned_ipv4 "$host")" ]]; then
+      msg_warn "Kein gueltiger /etc/hosts-Pin fuer ${host}."
+      return 1
+    fi
   done
+  if ! hosts_readable_by_apt; then
+    msg_warn "/etc/hosts ist fuer den apt-Benutzer nicht lesbar."
+    return 1
+  fi
   return 0
 }
 
 apt_update() {
-  apt-get -qq -o Acquire::ForceIPv4=true -o Acquire::Retries=10 -o Acquire::http::Timeout=20 update
+  apt-get -qq "${APT_NET_OPTS[@]}" "${APT_SANDBOX_ARGS[@]}" update
 }
 
 apt_install() {
-  apt-get install -y --no-install-recommends \
-    -o Acquire::ForceIPv4=true -o Acquire::Retries=10 -o Acquire::http::Timeout=20 "$@"
+  apt-get install -y --no-install-recommends "${APT_NET_OPTS[@]}" "${APT_SANDBOX_ARGS[@]}" "$@"
+}
+
+apt_install_file() {
+  apt-get install -y "${APT_NET_OPTS[@]}" "${APT_SANDBOX_ARGS[@]}" "$@"
 }
 
 ensure_container_dns
 
-if [[ -z "$MIRROR_IPS" ]] && resolve_mirror_ips_in_container; then
-  msg_ok "Mirror-IPs im Container aufgeloest: ${MIRROR_IPS% }"
-elif [[ -z "$MIRROR_IPS" ]]; then
-  msg_warn "Konnte Mirror-IPs im Container nicht aufloesen – fahre ohne /etc/hosts-Pinning fort."
-  MIRROR_IPS=""
+if [[ -z "$MIRROR_IPS" ]]; then
+  if resolve_mirror_ips_in_container; then
+    msg_ok "Mirror-IPs im Container aufgeloest: ${MIRROR_IPS% }"
+  else
+    msg_warn "Konnte Mirror-IPs nicht aufloesen – apt nutzt DNS."
+  fi
 fi
 apply_mirror_hosts
+ensure_hosts_permissions
 
-# Verifikation: apt braucht mindestens deb.debian.org und security.debian.org
-# gepinnt; sonst ist DNS-Flakiness wieder im Spiel.
+# Verifikation: apt braucht deb.debian.org und security.debian.org als
+# gueltige Pins, die auch der apt-Benutzer lesen kann.
 if ! ensure_mirror_pins_ready; then
-  msg_warn "Pins fuer deb.debian.org/security.debian.org fehlen – nochmal auflösen ..."
-  if resolve_mirror_ips_in_container; then
-    apply_mirror_hosts
-  fi
+  msg_warn "Mirror-Pins unvollstaendig – versuche erneut aufzuloesen ..."
+  resolve_mirror_ips_in_container >/dev/null 2>&1 || true
+  apply_mirror_hosts
+  ensure_hosts_permissions
 fi
-if ! ensure_mirror_pins_ready; then
-  msg_error "--- /etc/hosts ---"
-  cat /etc/hosts >&2 || true
-  msg_error "--- getent ahostsv4 deb.debian.org ---"
-  getent ahostsv4 deb.debian.org >&2 || true
-  die "Kritische Mirror-Pins fehlen – apt wuerde an DNS scheitern."
+if ensure_mirror_pins_ready; then
+  msg_ok "Mirror-Pins aktiv (deb.debian.org, security.debian.org)."
+else
+  msg_warn "Mirror-Pins nicht verfuegbar – apt nutzt DNS mit Retries."
 fi
-msg_ok "Mirror-Pins aktiv (deb.debian.org, security.debian.org)."
-
-# Waehrend apt DNS komplett ignorieren lassen: NSS nur ueber /etc/hosts.
-# Grund: auf dem Ziel-Host resolve apt trotz vorhandener /etc/hosts-Eintraege
-# ueber DNS und scheitert an transientem DNS. Mit 'hosts: files' ist apt
-# garantiert an die Pins gebunden.
-ORIG_HOSTS_LINE="$(grep -E '^hosts:' /etc/nsswitch.conf 2>/dev/null || true)"
-force_hosts_files() {
-  if grep -q '^hosts:' /etc/nsswitch.conf 2>/dev/null; then
-    sed -i 's/^hosts:.*/hosts: files/' /etc/nsswitch.conf
-  else
-    printf 'hosts: files\n' >> /etc/nsswitch.conf
-  fi
-  msg_ok "NSS: hosts-lookup auf 'files' umgestellt (DNS waehrend apt ignoriert)."
-}
-restore_hosts_line() {
-  if [[ -n "$ORIG_HOSTS_LINE" ]]; then
-    sed -i "s|^hosts:.*|$ORIG_HOSTS_LINE|" /etc/nsswitch.conf
-  fi
-}
-force_hosts_files
 
 msg_info "Installiere Systemabhaengigkeiten ..."
 for attempt in 1 2 3; do
@@ -766,8 +837,11 @@ for attempt in 1 2 3; do
   if (( attempt == 3 )); then
     die "apt-get update fehlgeschlagen (DNS/Netzwerk pruefen)."
   fi
-  msg_warn "apt-get update Versuch ${attempt}/3 fehlgeschlagen – DNS/Netzwerk reparieren ..."
-  repair_container_dns
+  msg_warn "apt-get update Versuch ${attempt}/3 fehlgeschlagen – DNS/Pins reparieren ..."
+  repair_container_dns || true
+  resolve_mirror_ips_in_container >/dev/null 2>&1 || true
+  apply_mirror_hosts
+  ensure_hosts_permissions
   sleep 5
 done
 for attempt in 1 2 3; do
@@ -783,13 +857,14 @@ for attempt in 1 2 3; do
   if (( attempt == 3 )); then
     die "apt-get install fehlgeschlagen (DNS/Netzwerk pruefen)."
   fi
-  msg_warn "apt-get install Versuch ${attempt}/3 fehlgeschlagen – DNS/Netzwerk reparieren ..."
-  repair_container_dns
+  msg_warn "apt-get install Versuch ${attempt}/3 fehlgeschlagen – DNS/Pins reparieren ..."
+  repair_container_dns || true
+  resolve_mirror_ips_in_container >/dev/null 2>&1 || true
+  apply_mirror_hosts
+  ensure_hosts_permissions
   sleep 5
 done
 msg_ok "Systempakete installiert."
-restore_hosts_line
-msg_ok "NSS hosts-lookup wiederhergestellt."
 
 if [[ "$(dpkg --print-architecture)" != "amd64" ]]; then
   die "Container-Architektur ist $(dpkg --print-architecture), erwartet amd64/x86_64."
@@ -808,7 +883,10 @@ checksum_line="$(awk -v f="$DEB" '{ name=$2; sub(/^\*/, "", name); if (name == f
 printf '%s\n' "$checksum_line" | sha256sum -c -
 msg_ok "SHA-256 geprueft."
 
-apt-get install -y "./${DEB}"
+# Vor der .deb-Installation Pins/Rechte erneut sicherstellen: apt loest hier
+# erneut auf (GitHub-Downloads liefen ueber curl, apt braucht eigene Pins).
+ensure_hosts_permissions
+apt_install_file "./${DEB}"
 msg_ok "BIMCraft installiert: $(dpkg-query -W -f='${Version}' bimcraft)."
 
 if ! getent passwd "$APP_USER" >/dev/null 2>&1; then
